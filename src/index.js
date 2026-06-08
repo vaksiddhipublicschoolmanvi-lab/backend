@@ -30,7 +30,7 @@ app.get("/", (req, res) => {
 
 // Public routes
 app.use("/", healthRoutes);
-app.use("/", qrRoutes);
+app.use("/qr", qrRoutes);
 
 // Protected routes
 app.use("/api/messages", apiKeyAuth, messageRoutes);
