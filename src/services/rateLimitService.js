@@ -1,73 +1,117 @@
-import { config } from '../config.js';
-import { query } from '../db/pool.js';
-import { cleanPhone } from '../whatsapp/phone.js';
+import { config } from "../config.js";
+import { query } from "../db/pool.js";
+import { cleanPhone } from "../whatsapp/phone.js";
 
 const ALLOWED_WITHOUT_OPT_IN = new Set([
-  'FEE_PAYMENT_RECEIPT',
-  'PAYMENT_SUCCESS',
-  'ADMISSION_CONFIRMATION'
+  "FEE_PAYMENT_RECEIPT",
+  "PAYMENT_SUCCESS",
+  "ADMISSION_CONFIRMATION",
+]);
+
+const UNRESTRICTED_RECEIPT_TYPES = new Set([
+  "FEE_PAYMENT_RECEIPT",
+  "PAYMENT_SUCCESS",
+  "FEE_RECEIPT",
 ]);
 
 export async function canSendMessage(queueMessage) {
+  const messageType = String(queueMessage.message_type || "").toUpperCase();
+
+  /*
+    Fee receipt/payment success messages are transactional.
+    These should send immediately without:
+    - office-hour restriction
+    - daily limit
+    - per-phone daily limit
+    - minimum gap delay
+    - opt-in required restriction
+
+    But if parent is explicitly opted out, we still block.
+  */
+  if (UNRESTRICTED_RECEIPT_TYPES.has(messageType)) {
+    const optIn = await getOptIn(queueMessage.recipient_phone);
+
+    if (optIn && optIn.is_opted_in === false) {
+      return {
+        allowed: false,
+        reason: "USER_OPTED_OUT",
+        cancel: true,
+      };
+    }
+
+    return {
+      allowed: true,
+      reason: "TRANSACTIONAL_RECEIPT_BYPASS",
+    };
+  }
+
   const currentTime = getLocalTimeParts();
 
   if (isOutsideOfficeHours(currentTime)) {
     return {
       allowed: false,
-      reason: 'OUTSIDE_OFFICE_HOURS',
-      rescheduleTomorrow: false
+      reason: "OUTSIDE_OFFICE_HOURS",
+      rescheduleTomorrow: false,
     };
   }
 
   const sentToday = await getSentTodayCount();
+
   if (sentToday >= config.dailyMessageLimit) {
     return {
       allowed: false,
-      reason: 'DAILY_LIMIT_REACHED',
-      rescheduleTomorrow: true
+      reason: "DAILY_LIMIT_REACHED",
+      rescheduleTomorrow: true,
     };
   }
 
-  const perPhoneSentToday = await getSentTodayCount(queueMessage.recipient_phone);
+  const perPhoneSentToday = await getSentTodayCount(
+    queueMessage.recipient_phone
+  );
+
   if (perPhoneSentToday >= config.perPhoneDailyLimit) {
     return {
       allowed: false,
-      reason: 'PER_PHONE_DAILY_LIMIT_REACHED',
-      rescheduleTomorrow: true
+      reason: "PER_PHONE_DAILY_LIMIT_REACHED",
+      rescheduleTomorrow: true,
     };
   }
 
   const latestSentAt = await getLatestSentAt();
+
   if (latestSentAt) {
     const elapsedMs = Date.now() - new Date(latestSentAt).getTime();
 
     if (elapsedMs < config.minGapBetweenMessagesMs) {
       return {
         allowed: false,
-        reason: 'MIN_GAP_NOT_COMPLETED',
-        rescheduleTomorrow: false
+        reason: "MIN_GAP_NOT_COMPLETED",
+        rescheduleTomorrow: false,
       };
     }
   }
 
   const optIn = await getOptIn(queueMessage.recipient_phone);
+
   if (optIn && optIn.is_opted_in === false) {
     return {
       allowed: false,
-      reason: 'USER_OPTED_OUT',
-      cancel: true
+      reason: "USER_OPTED_OUT",
+      cancel: true,
     };
   }
 
-  if (!optIn && !ALLOWED_WITHOUT_OPT_IN.has(String(queueMessage.message_type || '').toUpperCase())) {
+  if (!optIn && !ALLOWED_WITHOUT_OPT_IN.has(messageType)) {
     return {
       allowed: false,
-      reason: 'OPT_IN_REQUIRED',
-      cancel: true
+      reason: "OPT_IN_REQUIRED",
+      cancel: true,
     };
   }
 
-  return { allowed: true };
+  return {
+    allowed: true,
+  };
 }
 
 export async function rescheduleMessage(queueId, reason) {
@@ -118,7 +162,8 @@ export async function cancelMessageForSafety(message, reason) {
   );
 
   const updated = result.rows[0] || message;
-  await insertSafetyLog(updated, 'CANCELLED', reason);
+
+  await insertSafetyLog(updated, "CANCELLED", reason);
 
   return updated;
 }
@@ -126,17 +171,18 @@ export async function cancelMessageForSafety(message, reason) {
 export function getNextAllowedSendTime(reason) {
   const now = new Date();
 
-  if (reason === 'MIN_GAP_NOT_COMPLETED') {
+  if (reason === "MIN_GAP_NOT_COMPLETED") {
     return new Date(now.getTime() + 2 * 60 * 1000);
   }
 
   const parts = getLocalTimeParts(now);
+
   let year = parts.year;
   let month = parts.month;
   let day = parts.day;
   let hour = config.rescheduleHour;
 
-  if (reason === 'OUTSIDE_OFFICE_HOURS') {
+  if (reason === "OUTSIDE_OFFICE_HOURS") {
     hour = config.sendingStartHour;
 
     if (parts.hour >= config.sendingStartHour) {
@@ -146,16 +192,25 @@ export function getNextAllowedSendTime(reason) {
     ({ year, month, day } = addLocalDays(parts, 1));
   }
 
-  return makeDateInTimeZone(year, month, day, hour, 0, 0, config.timezone);
+  return makeDateInTimeZone(
+    year,
+    month,
+    day,
+    hour,
+    0,
+    0,
+    config.timezone
+  );
 }
 
 export async function getLimitStatus() {
-  const [sentToday, pendingCount, failedCount, cancelledCount] = await Promise.all([
-    getSentTodayCount(),
-    getQueueCountByStatus('PENDING'),
-    getQueueCountByStatus('FAILED'),
-    getQueueCountByStatus('CANCELLED')
-  ]);
+  const [sentToday, pendingCount, failedCount, cancelledCount] =
+    await Promise.all([
+      getSentTodayCount(),
+      getQueueCountByStatus("PENDING"),
+      getQueueCountByStatus("FAILED"),
+      getQueueCountByStatus("CANCELLED"),
+    ]);
 
   return {
     dailyLimit: config.dailyMessageLimit,
@@ -167,16 +222,17 @@ export async function getLimitStatus() {
     cancelledCount,
     officeHours: {
       startHour: config.sendingStartHour,
-      endHour: config.sendingEndHour
+      endHour: config.sendingEndHour,
     },
     timezone: config.timezone,
-    nextAllowedSendingWindow: getNextSendingWindow()
+    nextAllowedSendingWindow: getNextSendingWindow(),
+    unrestrictedReceiptTypes: Array.from(UNRESTRICTED_RECEIPT_TYPES),
   };
 }
 
 async function getSentTodayCount(phone) {
   const params = [];
-  let phoneFilter = '';
+  let phoneFilter = "";
 
   if (phone) {
     params.push(phone);
@@ -219,7 +275,11 @@ async function getLatestSentAt() {
 
 async function getOptIn(phone) {
   const cleanedPhone = cleanPhone(phone);
-  const alternatePhone = cleanedPhone.length === 10 ? `91${cleanedPhone}` : cleanedPhone.replace(/^91/, '');
+
+  const alternatePhone =
+    cleanedPhone.length === 10
+      ? `91${cleanedPhone}`
+      : cleanedPhone.replace(/^91/, "");
 
   const result = await query(
     `SELECT is_opted_in
@@ -251,34 +311,37 @@ async function insertSafetyLog(message, status, errorMessage) {
     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
     [
       message.id,
-      message.organization_id,
-      message.student_id,
-      message.admission_id,
-      message.parent_id,
-      message.recipient_name,
+      message.organization_id || null,
+      message.student_id || null,
+      message.admission_id || null,
+      message.parent_id || null,
+      message.recipient_name || null,
       message.recipient_phone,
-      message.message_type,
+      message.message_type || "GENERAL",
       message.message_text,
       status,
-      errorMessage
+      errorMessage,
     ]
   );
 }
 
 function getLocalTimeParts(date = new Date()) {
-  const formatter = new Intl.DateTimeFormat('en-US', {
+  const formatter = new Intl.DateTimeFormat("en-US", {
     timeZone: config.timezone,
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    hourCycle: 'h23'
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
   });
 
   const parts = formatter.formatToParts(date).reduce((acc, part) => {
-    if (part.type !== 'literal') acc[part.type] = Number(part.value);
+    if (part.type !== "literal") {
+      acc[part.type] = Number(part.value);
+    }
+
     return acc;
   }, {});
 
@@ -288,30 +351,56 @@ function getLocalTimeParts(date = new Date()) {
     day: parts.day,
     hour: parts.hour,
     minute: parts.minute,
-    second: parts.second
+    second: parts.second,
   };
 }
 
 function getNextSendingWindow() {
   const now = new Date();
   const parts = getLocalTimeParts(now);
+
   let year = parts.year;
   let month = parts.month;
   let day = parts.day;
   let startsAt = now;
 
   if (parts.hour < config.sendingStartHour) {
-    startsAt = makeDateInTimeZone(year, month, day, config.sendingStartHour, 0, 0, config.timezone);
+    startsAt = makeDateInTimeZone(
+      year,
+      month,
+      day,
+      config.sendingStartHour,
+      0,
+      0,
+      config.timezone
+    );
   } else if (isAfterOfficeHours(parts)) {
     ({ year, month, day } = addLocalDays(parts, 1));
-    startsAt = makeDateInTimeZone(year, month, day, config.sendingStartHour, 0, 0, config.timezone);
+
+    startsAt = makeDateInTimeZone(
+      year,
+      month,
+      day,
+      config.sendingStartHour,
+      0,
+      0,
+      config.timezone
+    );
   }
 
-  const endsAt = makeDateInTimeZone(year, month, day, config.sendingEndHour, 0, 0, config.timezone);
+  const endsAt = makeDateInTimeZone(
+    year,
+    month,
+    day,
+    config.sendingEndHour,
+    0,
+    0,
+    config.timezone
+  );
 
   return {
     startsAt: startsAt.toISOString(),
-    endsAt: endsAt.toISOString()
+    endsAt: endsAt.toISOString(),
   };
 }
 
@@ -320,20 +409,33 @@ function isOutsideOfficeHours(parts) {
 }
 
 function isAfterOfficeHours(parts) {
-  return parts.hour > config.sendingEndHour || (parts.hour === config.sendingEndHour && parts.minute > 0);
+  return (
+    parts.hour > config.sendingEndHour ||
+    (parts.hour === config.sendingEndHour && parts.minute > 0)
+  );
 }
 
 function addLocalDays(parts, days) {
-  const utcDate = new Date(Date.UTC(parts.year, parts.month - 1, parts.day + days, 12, 0, 0));
+  const utcDate = new Date(
+    Date.UTC(parts.year, parts.month - 1, parts.day + days, 12, 0, 0)
+  );
 
   return {
     year: utcDate.getUTCFullYear(),
     month: utcDate.getUTCMonth() + 1,
-    day: utcDate.getUTCDate()
+    day: utcDate.getUTCDate(),
   };
 }
 
-function makeDateInTimeZone(year, month, day, hour, minute, second, timeZone) {
+function makeDateInTimeZone(
+  year,
+  month,
+  day,
+  hour,
+  minute,
+  second,
+  timeZone
+) {
   const utcGuess = new Date(Date.UTC(year, month - 1, day, hour, minute, second));
   const offsetMs = getTimeZoneOffsetMs(utcGuess, timeZone);
 
@@ -341,19 +443,22 @@ function makeDateInTimeZone(year, month, day, hour, minute, second, timeZone) {
 }
 
 function getTimeZoneOffsetMs(date, timeZone) {
-  const parts = new Intl.DateTimeFormat('en-US', {
+  const parts = new Intl.DateTimeFormat("en-US", {
     timeZone,
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    hourCycle: 'h23'
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
   }).formatToParts(date);
 
   const values = parts.reduce((acc, part) => {
-    if (part.type !== 'literal') acc[part.type] = Number(part.value);
+    if (part.type !== "literal") {
+      acc[part.type] = Number(part.value);
+    }
+
     return acc;
   }, {});
 
