@@ -1,16 +1,19 @@
-import { config } from '../config.js';
-import { query } from '../db/pool.js';
-import { cleanPhone } from '../whatsapp/phone.js';
-import { sendWhatsAppMessage } from '../whatsapp/client.js';
+import { config } from "../config.js";
+import { query } from "../db/pool.js";
+import { cleanPhone } from "../whatsapp/phone.js";
+import { sendWhatsAppMessage } from "../whatsapp/client.js";
 
 export async function enqueueMessage(payload) {
   if (!payload?.recipient_phone) {
-    throw new Error('recipient_phone is required');
+    throw new Error("recipient_phone is required");
   }
 
   if (!payload?.message_text) {
-    throw new Error('message_text is required');
+    throw new Error("message_text is required");
   }
+
+  const priority = Number(payload.priority ?? 5);
+  const maxAttempts = Number(payload.max_attempts ?? config.maxAttempts ?? 3);
 
   const result = await query(
     `INSERT INTO whatsapp_message_queue (
@@ -27,7 +30,20 @@ export async function enqueueMessage(payload) {
       scheduled_at,
       created_by
     )
-    VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, 'GENERAL'), $8, COALESCE($9, 5), COALESCE($10, $11), COALESCE($12, CURRENT_TIMESTAMP), $13)
+    VALUES (
+      $1,
+      $2,
+      $3,
+      $4,
+      $5,
+      $6,
+      COALESCE($7, 'GENERAL'),
+      $8,
+      COALESCE($9::integer, 5),
+      COALESCE($10::integer, 3),
+      COALESCE($11::timestamp, CURRENT_TIMESTAMP),
+      $12
+    )
     RETURNING *`,
     [
       payload.organization_id || null,
@@ -36,13 +52,12 @@ export async function enqueueMessage(payload) {
       payload.parent_id || null,
       payload.recipient_name || null,
       payload.recipient_phone,
-      payload.message_type || 'GENERAL',
+      payload.message_type || "GENERAL",
       payload.message_text,
-      payload.priority ?? 5,
-      payload.max_attempts || null,
-      config.maxAttempts,
+      Number.isFinite(priority) ? priority : 5,
+      Number.isFinite(maxAttempts) ? maxAttempts : 3,
       payload.scheduled_at || null,
-      payload.created_by || null
+      payload.created_by || null,
     ]
   );
 
@@ -52,7 +67,11 @@ export async function enqueueMessage(payload) {
 export const createQueueMessage = enqueueMessage;
 
 export async function getQueueMessage(id) {
-  const result = await query('SELECT * FROM whatsapp_message_queue WHERE id = $1', [id]);
+  const result = await query(
+    "SELECT * FROM whatsapp_message_queue WHERE id = $1",
+    [id]
+  );
+
   return result.rows[0] || null;
 }
 
@@ -71,7 +90,7 @@ export async function getMessages({ status, limit } = {}) {
   const result = await query(
     `SELECT *
      FROM whatsapp_message_queue
-     ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
+     ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
      ORDER BY created_at DESC
      LIMIT $${params.length}`,
     params
@@ -116,7 +135,10 @@ export async function getQueueStats() {
 export async function sendQueuedMessage(message) {
   await ensureRecipientIsOptedIn(message.recipient_phone);
 
-  const sendResult = await sendWhatsAppMessage(message.recipient_phone, message.message_text);
+  const sendResult = await sendWhatsAppMessage(
+    message.recipient_phone,
+    message.message_text
+  );
 
   await markMessageSent(message, sendResult.whatsappMessageId);
 
@@ -137,16 +159,18 @@ export async function markMessageSent(message, whatsappMessageId) {
   );
 
   const updated = result.rows[0];
-  await createMessageLog(updated || message, 'SENT', whatsappMessageId, null);
+
+  await createMessageLog(updated || message, "SENT", whatsappMessageId, null);
 
   return updated;
 }
 
 export async function markMessageFailed(message, error) {
   const errorMessage = error?.message || String(error);
-  const nextAttempts = Number(message.attempts) + 1;
-  const shouldRetry = nextAttempts < Number(message.max_attempts);
-  const status = shouldRetry ? 'PENDING' : 'FAILED';
+  const nextAttempts = Number(message.attempts || 0) + 1;
+  const maxAttempts = Number(message.max_attempts || config.maxAttempts || 3);
+  const shouldRetry = nextAttempts < maxAttempts;
+  const status = shouldRetry ? "PENDING" : "FAILED";
 
   const result = await query(
     `UPDATE whatsapp_message_queue
@@ -161,12 +185,16 @@ export async function markMessageFailed(message, error) {
   );
 
   const updated = result.rows[0];
-  await createMessageLog(updated || message, 'FAILED', null, errorMessage);
+
+  await createMessageLog(updated || message, "FAILED", null, errorMessage);
 
   return updated;
 }
 
-export async function releaseClaimedMessage(message, reason = 'WhatsApp is not connected') {
+export async function releaseClaimedMessage(
+  message,
+  reason = "WhatsApp is not connected"
+) {
   const result = await query(
     `UPDATE whatsapp_message_queue
      SET status = 'PENDING',
@@ -183,13 +211,19 @@ export async function releaseClaimedMessage(message, reason = 'WhatsApp is not c
 
 async function ensureRecipientIsOptedIn(phone) {
   const cleanedPhone = cleanPhone(phone);
+
+  const alternatePhone =
+    cleanedPhone.length === 10
+      ? `91${cleanedPhone}`
+      : cleanedPhone.replace(/^91/, "");
+
   const result = await query(
     `SELECT is_opted_in
      FROM whatsapp_opt_ins
      WHERE phone IN ($1, $2)
      ORDER BY updated_at DESC
      LIMIT 1`,
-    [cleanedPhone, cleanedPhone.length === 10 ? `91${cleanedPhone}` : cleanedPhone.replace(/^91/, '')]
+    [cleanedPhone, alternatePhone]
   );
 
   if (result.rows[0]?.is_opted_in === false) {
@@ -197,7 +231,12 @@ async function ensureRecipientIsOptedIn(phone) {
   }
 }
 
-async function createMessageLog(message, status, whatsappMessageId, errorMessage) {
+async function createMessageLog(
+  message,
+  status,
+  whatsappMessageId,
+  errorMessage
+) {
   await query(
     `INSERT INTO whatsapp_message_logs (
       queue_id,
@@ -214,20 +253,34 @@ async function createMessageLog(message, status, whatsappMessageId, errorMessage
       error_message,
       sent_at
     )
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, CASE WHEN $10 = 'SENT' THEN CURRENT_TIMESTAMP ELSE NULL END)`,
+    VALUES (
+      $1,
+      $2,
+      $3,
+      $4,
+      $5,
+      $6,
+      $7,
+      $8,
+      $9,
+      $10,
+      $11,
+      $12,
+      CASE WHEN $10 = 'SENT' THEN CURRENT_TIMESTAMP ELSE NULL END
+    )`,
     [
       message.id,
-      message.organization_id,
-      message.student_id,
-      message.admission_id,
-      message.parent_id,
-      message.recipient_name,
+      message.organization_id || null,
+      message.student_id || null,
+      message.admission_id || null,
+      message.parent_id || null,
+      message.recipient_name || null,
       message.recipient_phone,
-      message.message_type,
+      message.message_type || "GENERAL",
       message.message_text,
       status,
       whatsappMessageId,
-      errorMessage
+      errorMessage,
     ]
   );
 }
