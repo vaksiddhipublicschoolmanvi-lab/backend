@@ -3,6 +3,7 @@ import makeWASocket, {
   fetchLatestBaileysVersion,
   useMultiFileAuthState
 } from '@whiskeysockets/baileys';
+import { mkdir, rm } from 'node:fs/promises';
 import pino from 'pino';
 import qrcode from 'qrcode-terminal';
 import { config } from '../config.js';
@@ -44,7 +45,7 @@ async function createClient() {
 
   socket.ev.on('creds.update', saveCreds);
 
-  socket.ev.on('connection.update', ({ connection, lastDisconnect, qr }) => {
+  socket.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
     lastConnectionUpdate = new Date().toISOString();
 
     if (qr) {
@@ -69,6 +70,7 @@ async function createClient() {
       const statusCode = lastDisconnect?.error?.output?.statusCode;
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
       socket = null;
+      userInfo = null;
 
       logger.warn({ statusCode, shouldReconnect }, 'WhatsApp connection closed');
 
@@ -80,12 +82,40 @@ async function createClient() {
         }, 5000);
       } else {
         latestQr = null;
-        logger.error('WhatsApp logged out. Delete session files and scan a new QR code.');
+        logger.warn(
+          {
+            sessionDir: config.sessionDir
+          },
+          'WhatsApp logged out. Clearing stale session files before requesting a new QR code.'
+        );
+
+        try {
+          await resetSessionDir();
+
+          setTimeout(() => {
+            startWhatsAppClient().catch((error) => {
+              logger.error({ err: error }, 'WhatsApp restart after logout failed');
+            });
+          }, 1000);
+        } catch (error) {
+          logger.error(
+            {
+              err: error,
+              sessionDir: config.sessionDir
+            },
+            'Failed to clear WhatsApp session files. Delete the session directory manually and restart.'
+          );
+        }
       }
     }
   });
 
   return socket;
+}
+
+async function resetSessionDir() {
+  await rm(config.sessionDir, { recursive: true, force: true });
+  await mkdir(config.sessionDir, { recursive: true });
 }
 
 export function getWhatsAppStatus() {
