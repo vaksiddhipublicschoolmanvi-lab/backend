@@ -148,3 +148,23 @@ export async function sendWhatsAppMessage(phone, messageText) {
     raw: result
   };
 }
+
+export async function disconnectWhatsApp() {
+  if (socket) {
+    try {
+      await socket.logout();
+    } catch (err) {
+      logger.warn({ err }, 'Failed to logout socket gracefully, ending connection');
+      try {
+        socket.end();
+      } catch (endErr) {
+        logger.error({ err: endErr }, 'Failed to end socket connection');
+      }
+    }
+    socket = null;
+  }
+  userInfo = null;
+  latestQr = null;
+  connectionState = 'closed';
+  await resetSessionDir();
+}

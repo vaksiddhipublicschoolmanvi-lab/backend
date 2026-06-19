@@ -9,6 +9,7 @@ import { apiKeyAuth } from "./middleware/apiKey.js";
 import { healthRoutes } from "./routes/health.routes.js";
 import { messageRoutes } from "./routes/message.routes.js";
 import { qrRoutes } from "./routes/qr.routes.js";
+import { instanceRoutes } from "./routes/instance.routes.js";
 
 import { startQueueWorker, stopQueueWorker } from "./services/queueWorker.js";
 import { logger } from "./utils/logger.js";
@@ -34,6 +35,7 @@ app.use("/qr", qrRoutes);
 
 // Protected routes
 app.use("/api/messages", apiKeyAuth, messageRoutes);
+app.use("/api/instance", apiKeyAuth, instanceRoutes);
 
 // 404
 app.use((req, res) => {
